@@ -53,7 +53,7 @@ vừa đọc: -47.16 điểm trên full stack (92.52 -> 45.36), không có một
 thông báo lỗi nào.
 
 CÔNG CỤ CÓ SẴN:
-    from arena.model import FINALIZE_SENTINEL
+    from arena.model import FINALIZE_SENTINEL, RealModel, is_degraded
     from arena.tools import ToolResult
     ctx.tools.calls      -> số lượt gọi công cụ đã dùng (kể cả submit)
     ctx.max_tool_calls   -> ngân sách của brief, hoặc None nếu brief không đặt
@@ -64,8 +64,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import FINALIZE_SENTINEL
-from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
+from arena.model import FINALIZE_SENTINEL, RealModel, is_degraded
+from arena.tools import ToolResult
 
 from harness.middleware import Middleware
 
@@ -78,6 +78,78 @@ NUDGE = (
 )
 
 
+DUPLICATE_NOTE = (
+    "Lệnh này đã được gọi với đúng tham số đó ở một lượt trước và kết quả nằm ở "
+    "phía trên — không tốn thêm ngân sách. Đừng lặp lại: dùng một truy vấn KHÁC "
+    "hoặc một tài liệu chưa đọc, hoặc viết FINAL nếu đã đủ bằng chứng."
+)
+
+
+#: Search breadth on a live endpoint. Measured on gpt-oss:120b's own
+#: queries: the answer document of the deep briefs ranks 4th-7th, i.e. just
+#: outside the k=5 the model asks for. Breadth costs no tool call; kept
+#: under 8 so one search cannot trip the runner's dump-signature review flag
+#: (>= 8 distinct docs returned with <= 3 model calls).
+LIVE_SEARCH_K = 7
+
+#: Characters of snippet kept per hit in a compacted search observation.
+COMPACT_SNIPPET_CHARS = 140
+
+EMPTY_SEARCH_NOTE = (
+    "(không có kết quả — hãy thử truy vấn ngắn hơn, bỏ dấu ngoặc kép, dùng tên "
+    "lĩnh vực chung)"
+)
+
+
+def _live(ctx) -> bool:
+    """A real HTTP endpoint (`RealModel`), possibly behind the runner's proxy."""
+    model = getattr(ctx, "model", None)
+    return isinstance(getattr(model, "inner", model), RealModel)
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _compact_search(result):
+    """One line per hit: doc_id, title, and the snippet minus its first line
+    (the corpus-wide document header). Cuts the tokens of a wider search;
+    doc_ids and titles — what the model picks fetches from — stay intact.
+    Anything that is not a clean JSON hit list passes through untouched."""
+    import json
+
+    if not result.ok or not isinstance(result.content, str):
+        return result
+    try:
+        hits = json.loads(result.content)
+    except ValueError:
+        return result
+    if not isinstance(hits, list) or not all(isinstance(h, dict) for h in hits):
+        return result
+    lines = []
+    for hit in hits:
+        snippet = str(hit.get("snippet", "")).split("\n")
+        tail = " / ".join(part.strip() for part in snippet[1:] if part.strip())
+        lines.append(
+            f"{hit.get('doc_id', '')} | {hit.get('title', '')} | {tail[:COMPACT_SNIPPET_CHARS]}"
+        )
+    content = "\n".join(lines) if lines else EMPTY_SEARCH_NOTE
+    return ToolResult(ok=True, content=content, error=result.error)
+
+
+def _call_key(name, args) -> str:
+    """Canonical identity of a tool call; search queries compare normalised."""
+    import json
+
+    args = dict(args) if isinstance(args, dict) else {}
+    if isinstance(args.get("query"), str):
+        args["query"] = " ".join(args["query"].casefold().split())
+    return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+
+
 class BudgetPolicy(Middleware):
     """Ép mô hình chốt FINAL ngay khi ngân sách công cụ đã tiêu hết."""
 
@@ -87,23 +159,37 @@ class BudgetPolicy(Middleware):
         self.reserve = max(0, int(reserve))
 
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not self._spent(ctx):
+            return messages
+        return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        # A call identical to one that already came back clean buys nothing
+        # but spends budget — measured on gpt-oss:120b: the same search sent
+        # three times and the same doc fetched five, on an 8-call budget.
+        # Answer it from memory instead, without touching the tool.
+        key = _call_key(name, args)
+        done = ctx.state.setdefault("budget_done_calls", set())
+        if key in done:
+            ctx.state["budget_duplicates"] = ctx.state.get("budget_duplicates", 0) + 1
+            return ToolResult(ok=True, content=DUPLICATE_NOTE, error=None)
+        if not self._spent(ctx) or name == "submit":
+            live = _live(ctx)
+            if live and name == "search":
+                args = {**args, "k": max(_as_int(args.get("k"), 5), LIVE_SEARCH_K)}
+            result = call(name, args)
+            if result.ok and not is_degraded(result.content):
+                done.add(key)
+            if live and name == "search":
+                result = _compact_search(result)
+            return result
+        ctx.state["budget_blocked"] = ctx.state.get("budget_blocked", 0) + 1
+        return ToolResult(
+            ok=False,
+            content="",
+            error="Ngân sách công cụ đã hết — hãy trả lời FINAL bằng bằng chứng đang có.",
+        )

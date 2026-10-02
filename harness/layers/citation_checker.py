@@ -59,7 +59,12 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
 
 
 class CitationChecker(Middleware):
@@ -68,16 +73,55 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            doc = ctx.corpus.get(claim.get("doc_id") or "")
+            if doc is not None and _on_a_line(claim["text"], doc.body):
+                continue
+            source = _source_doc(ctx, claim["text"])
+            if source is not None:
+                claim["doc_id"] = source
+        report["citations"] = sorted(
+            {c["doc_id"] for c in claims if isinstance(c, dict) and c.get("doc_id")}
+        )
+        return report
+
+
+def _norm(text) -> str:
+    """Chuẩn hoá giống scorer (NFC, casefold, gộp khoảng trắng) — chỉ để SO
+    SÁNH, không bao giờ ghi ngược vào `claim["text"]`."""
+    if not isinstance(text, str):
+        return ""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _on_a_line(text, body) -> bool:
+    """`text` có phải trích nguyên văn MỘT DÒNG của `body` không."""
+    needle = _norm(text)
+    if not needle or not isinstance(body, str):
+        return False
+    return any(needle in _norm(line) for line in body.splitlines())
+
+
+def _source_doc(ctx, text):
+    """doc_id của tài liệu ĐÃ QUAN SÁT có một dòng chứa `text`, hoặc None.
+
+    Ưu tiên tài liệu về nguyên vẹn từ một lần fetch sạch; sau đó mới tới
+    tài liệu chỉ được nhắc doc_id trong quan sát (vd. kết quả search).
+    """
+    observed = _norm(ctx.observed_text)
+    needle = _norm(text)
+    if not needle or needle not in observed:
+        return None
+    candidates = [doc for doc in ctx.corpus.docs if _on_a_line(text, doc.body)]
+    for doc in candidates:
+        if _norm(doc.body) in observed:
+            return doc.doc_id
+    for doc in candidates:
+        if doc.doc_id in ctx.observed_text:
+            return doc.doc_id
+    return None

@@ -50,7 +50,10 @@ tra ngân sách làm cả stack tiêu lố: đo được 34/120 lượt chạy k
 lượt gọi trong khi brief cho 8, và efficiency tụt từ 14.24 xuống 12.06.
 
 CÔNG CỤ CÓ SẴN:
-    from arena.model import is_degraded
+    import json
+import re
+
+from arena.model import ModelResponse, is_degraded, parse_output
     ctx.state           -> dict tuỳ bạn dùng để đếm số lần thử lại
     ctx.tools.calls     -> số lượt gọi công cụ đã dùng (kể cả submit)
     ctx.max_tool_calls  -> ngân sách của brief, hoặc None
@@ -61,8 +64,12 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+import json
+import re
 
+from arena.model import ModelResponse, is_degraded, parse_output
+
+from harness.agent import _canonicalise
 from harness.middleware import Middleware
 
 #: Tổng số lần thử, tính cả lần đầu.
@@ -87,15 +94,54 @@ class Retry(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        limit = ctx.max_tool_calls
+        while attempts < self.max_attempts and (
+            (not result.ok) or is_degraded(result.content)
+        ):
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_extra"] = ctx.state.get("retry_extra", 0) + attempts - 1
+        return result
+
+    def after_model(self, ctx, response):
+        """Cứu một lượt ACTION bị viết sai hình dạng — cũng là một kiểu hỏng.
+
+        gpt-oss viết `THOUGHT: ... ACTION: {...}` trên CÙNG một dòng, có khi
+        vài ACTION liền nhau rồi dính văn xuôi (`...}We need to wait`), trong
+        khi parser đóng băng chỉ nhận `ACTION:` ở đầu dòng: đo được ~25 lượt
+        của một lượt chạy mất vào "không đọc được ACTION". Thử lại ở đây rẻ
+        hơn một vòng gọi model: lấy ACTION ĐẦU TIÊN còn nguyên vẹn. Không bao
+        giờ đụng tới FINAL — provenance được chấm trên chữ gốc trên trace.
+        """
+        text = response.text
+        if not isinstance(text, str) or "FINAL" in text.upper():
+            return response
+        if parse_output(_canonicalise(text)).kind != "unparseable":
+            return response
+        action = _first_action(text)
+        if action is None:
+            return response
+        ctx.state["retry_salvaged_actions"] = ctx.state.get("retry_salvaged_actions", 0) + 1
+        return ModelResponse(
+            text=f"ACTION: {action}",
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
+
+
+_ACTION_MARKER_RE = re.compile(r"ACTION[ \t]*:[ \t]*(?=\{)")
+
+
+def _first_action(text: str):
+    """JSON của ACTION đầu tiên giải mã được trong `text`, hoặc None."""
+    for match in _ACTION_MARKER_RE.finditer(text):
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text[match.end():])
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("tool"), str):
+            return json.dumps(payload, ensure_ascii=False)
+    return None

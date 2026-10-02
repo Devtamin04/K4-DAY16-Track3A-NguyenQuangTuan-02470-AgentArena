@@ -20,3 +20,6 @@ phases/private/
 
 # macOS
 .DS_Store
+
+# Local API credentials — never commit
+.env
